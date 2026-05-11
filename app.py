@@ -1,5 +1,6 @@
 import gradio as gr
 import json
+import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # 1. Load model (runs on free CPU)
@@ -7,15 +8,17 @@ MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype="auto", device_map="cpu")
 
-# 2. Your ticket JSON examples (add/replace as needed)
-EXAMPLES = [
-    {"input": "Subject: Duplicate charge\nBody: Charged twice for Pro plan. Receipt #8842.",
-     "output": '{"team": "billing", "priority": "high", "summary": "Duplicate subscription charge", "action": "Verify payment logs, issue refund, email confirmation."}'},
-    {"input": "Subject: Calendar sync broken\nBody: Google Calendar fails with 403 after OAuth.",
-     "output": '{"team": "technical", "priority": "medium", "summary": "OAuth scope mismatch", "action": "Check API permissions, re-auth user, test webhook."}'},
-    {"input": "Subject: SSO login failed\nBody: New user gets Invalid SAML assertion on first login.",
-     "output": '{"team": "security", "priority": "high", "summary": "SAML assertion validation error", "action": "Verify IdP attribute mapping, check ACS URL, test with staging tenant."}'}
-]
+# 2. Load few-shot examples from tickets.jsonl
+EXAMPLES_FILE = "tickets.jsonl"
+if os.path.exists(EXAMPLES_FILE):
+    with open(EXAMPLES_FILE, "r", encoding="utf-8") as f:
+        EXAMPLES = [json.loads(line) for line in f if line.strip()]
+else:
+    # Fallback for local testing
+    EXAMPLES = [
+        {"input": "Subject: Duplicate charge\nBody: Charged twice.", 
+         "output": '{"team": "billing", "priority": "high", "summary": "Duplicate charge", "action": "Verify logs & refund."}'}
+    ]
 
 # 3. Build prompt using model's native chat template
 def build_prompt(user_ticket):
@@ -28,6 +31,9 @@ def build_prompt(user_ticket):
 
 # 4. Inference function
 def route_ticket(ticket_text):
+    if not ticket_text.strip():
+        return "⚠️ Please enter a ticket subject & body."
+        
     prompt = build_prompt(ticket_text)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=128, temperature=0.3, do_sample=True)
@@ -50,7 +56,7 @@ demo = gr.Interface(
     inputs=gr.Textbox(lines=4, placeholder="Paste customer ticket here (Subject + Body)..."),
     outputs=gr.Textbox(lines=8, label="Routing Result"),
     title="🎫 SaaS Ticket Router",
-    description="Routes raw support tickets using in-context learning. No fine-tuning required."
+    description="Routes raw support tickets using in-context learning. Data loaded dynamically from `tickets.jsonl`."
 )
 
 demo.launch()
