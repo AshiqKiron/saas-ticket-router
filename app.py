@@ -1,62 +1,71 @@
 import gradio as gr
 import json
+import re
 import os
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from llama_cpp import Llama
 
-# 1. Load model (runs on free CPU)
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype="auto", device_map="cpu")
+# 1. Load fast GGUF model (INT4 quantized ~1.1GB)
+MODEL_REPO = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+MODEL_FILE = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
-# 2. Load few-shot examples from tickets.jsonl
-EXAMPLES_FILE = "tickets.jsonl"
-if os.path.exists(EXAMPLES_FILE):
-    with open(EXAMPLES_FILE, "r", encoding="utf-8") as f:
-        EXAMPLES = [json.loads(line) for line in f if line.strip()]
-else:
-    # Fallback for local testing
-    EXAMPLES = [
-        {"input": "Subject: Duplicate charge\nBody: Charged twice.", 
-         "output": '{"team": "billing", "priority": "high", "summary": "Duplicate charge", "action": "Verify logs & refund."}'}
-    ]
+print("⏳ Loading model... (first run downloads ~1.1GB)")
+llm = Llama.from_pretrained(
+    repo_id=MODEL_REPO,
+    filename=MODEL_FILE,
+    n_ctx=768,          # Reduced context = faster
+    n_threads=4,        # Match HF vCPU cores
+    n_gpu_layers=-1,    # Auto-detect (0 on CPU, >0 if GPU enabled)
+    verbose=False
+)
 
-# 3. Build prompt using model's native chat template
-def build_prompt(user_ticket):
-    messages = [{"role": "system", "content": "You are a SaaS support triage assistant. Route tickets to the correct team with priority, summary, and action steps. Output valid JSON only."}]
+# 2. Minimal few-shot examples (less prompt = faster)
+EXAMPLES = [
+    {"input": "Subject: Duplicate charge\nBody: Charged twice for Pro.", 
+     "output": '{"team":"billing","priority":"high","summary":"Duplicate charge","action":"Verify logs & refund."}'},
+    {"input": "Subject: API 429 error\nBody: Rate limit hit on webhooks.", 
+     "output": '{"team":"technical","priority":"high","summary":"Rate limit exceeded","action":"Check quota & scale consumers."}'}
+]
+
+def build_prompt(ticket):
+    prompt = "You are a SaaS support router. Output ONLY valid JSON with keys: team, priority, summary, action.\n"
     for ex in EXAMPLES:
-        messages.append({"role": "user", "content": ex["input"]})
-        messages.append({"role": "assistant", "content": ex["output"]})
-    messages.append({"role": "user", "content": user_ticket})
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt += f"User: {ex['input']}\nAssistant: {ex['output']}\n"
+    prompt += f"User: {ticket}\nAssistant: "
+    return prompt
 
-# 4. Inference function
 def route_ticket(ticket_text):
     if not ticket_text.strip():
-        return "⚠️ Please enter a ticket subject & body."
+        return "⚠️ Please enter a ticket."
         
     prompt = build_prompt(ticket_text)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=128, temperature=0.3, do_sample=True)
-    full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
-    # Extract only the assistant's response
-    if "<|im_start|>assistant\n" in full_text:
-        raw = full_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-    else:
-        raw = full_text.split("assistant\n")[-1].strip()
-        
-    try:
-        return json.dumps(json.loads(raw), indent=2)
-    except json.JSONDecodeError:
-        return f"⚠️ Output wasn't valid JSON:\n{raw}"
+    # Fast C++ inference
+    output = llm(
+        prompt, 
+        max_tokens=60, 
+        temperature=0.1, 
+        top_p=0.9, 
+        stop=["\nUser:"],
+        echo=False
+    )
+    
+    raw = output['choices'][0]['text'].strip()
+    
+    # Robust JSON extraction
+    match = re.search(r'({.*})', raw, re.DOTALL)
+    if match:
+        try:
+            return json.dumps(json.loads(match.group(1)), indent=2)
+        except json.JSONDecodeError:
+            return f"⚠️ JSON parse error:\n{match.group(1)}"
+    return f"⚠️ No JSON found. Raw:\n{raw}"
 
-# 5. Gradio UI
 demo = gr.Interface(
     fn=route_ticket,
-    inputs=gr.Textbox(lines=4, placeholder="Paste customer ticket here (Subject + Body)..."),
-    outputs=gr.Textbox(lines=8, label="Routing Result"),
-    title="🎫 SaaS Ticket Router",
-    description="Routes raw support tickets using in-context learning. Data loaded dynamically from `tickets.jsonl`."
+    inputs=gr.Textbox(lines=3, placeholder="Subject: ...\nBody: ..."),
+    outputs=gr.Textbox(lines=5, label="Routing Result"),
+    title="🎫 Fast SaaS Ticket Router",
+    description="Optimized C++ inference + INT4 quantization. ~3-4s on free CPU."
 )
 
 demo.launch()
